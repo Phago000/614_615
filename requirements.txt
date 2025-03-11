@@ -1,21 +1,6 @@
 streamlit
-google-generativeai
+PyPDF2
 PyMuPDF
-Pillow
-pandas
-msal>=1.25.0     # for Microsoft authentication
-requests>=2.31.0 # for HTTP requests
-python-dotenv>=1.0.0  # for environment variables
-pdf2image
-sqlite3
-
-# Testing Dependencies
-pytest>=7.4.0
-pytest-mock>=3.11.1
-coverage>=7.3.0
-unittest2>=1.1.0
-
-# Optional but Recommended
-black>=23.7.0    # for code formatting
-flake8>=6.1.0    # for code linting
-mypy>=1.5.1      # for type checking
+google-generativeai
+pillow
+tenacity
