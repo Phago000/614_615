@@ -213,16 +213,23 @@ def extract_code_with_ai(pdf_path, page_number, api_key, status_text):
         return {"code": "UNK", "method": "error", "confidence": "low", "text": page_text if 'page_text' in locals() else ""}
 
 def convert_pdf_to_image(pdf_path, page_num):
-    """將PDF頁面轉換為圖像"""
+    """將PDF頁面轉換為圖像 - 增強清晰度版本"""
     doc = None
     try:
         doc = fitz.open(pdf_path)
         page = doc[page_num]
-        zoom = 4
+        
+        # 增加放大比例
+        zoom = 6
         mat = fitz.Matrix(zoom, zoom)
+        
+        # 使用高DPI和無壓縮設置
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img_data = pix.tobytes("png")
+        
+        # 使用PIL進一步控制圖像質量
         img = Image.open(io.BytesIO(img_data))
+        
         return img
     except Exception as e:
         add_log(f"PDF轉圖像錯誤: {str(e)}", "error")
@@ -301,12 +308,15 @@ def process_pdf(uploaded_file, progress_bar, status_text):
         total_pages = len(doc)
         doc.close()
         
-        # 處理每一頁
+        # 用於存儲頁面的代碼信息
+        page_codes = []
+        
+        # 第一步：識別所有頁面的代碼
         for page_num in range(total_pages):
-            # 更新進度
-            progress = (page_num + 1) / total_pages
+            # 更新進度 - 這部分占總進度的一半
+            progress = (page_num + 1) / (total_pages * 2)  # 總進度的50%
             progress_bar.progress(progress)
-            status_text.text(f"處理第 {page_num + 1}/{total_pages} 頁...")
+            status_text.text(f"識別第 {page_num + 1}/{total_pages} 頁的代碼...")
             
             # 從頁面提取文本
             doc = fitz.open(temp_path)
@@ -315,28 +325,90 @@ def process_pdf(uploaded_file, progress_bar, status_text):
             
             # 檢查是否為摘要頁
             if is_summary_page(page_text) or page_num == total_pages - 1:
+                page_codes.append({
+                    'page_num': page_num,
+                    'code': 'SUMMARY',
+                    'text': page_text
+                })
                 continue
             
             # 提取代碼
             code_info = extract_code_with_ai(temp_path, page_num, GEMINI_API_KEY, status_text)
             
-            if not code_info or code_info.get('code') == 'UNK' or code_info.get('code') == 'ALL':
+            code = code_info.get('code', 'UNK')
+            if code in ['UNK', 'ALL']:
+                code = 'UNKNOWN'
+            
+            # 存儲頁面代碼信息
+            page_codes.append({
+                'page_num': page_num,
+                'code': code,
+                'text': code_info.get('text', ''),
+                'method': code_info.get('method', 'text_rule'),
+                'confidence': code_info.get('confidence', 'medium')
+            })
+            
+            # 暫停一下，確保界面更新
+            time.sleep(0.1)
+        
+        # 第二步：識別連續相同代碼的頁面組
+        page_groups = []
+        current_group = []
+        
+        for i, page_info in enumerate(page_codes):
+            if page_info['code'] == 'SUMMARY':
+                # 摘要頁不計入分組
+                if current_group:
+                    page_groups.append(current_group)
+                    current_group = []
+                continue
+                
+            if not current_group:
+                # 開始新的組
+                current_group = [page_info]
+            elif page_info['code'] == current_group[0]['code']:
+                # 添加到當前組
+                current_group.append(page_info)
+            else:
+                # 結束當前組並開始新的組
+                page_groups.append(current_group)
+                current_group = [page_info]
+        
+        # 添加最後一個組
+        if current_group:
+            page_groups.append(current_group)
+        
+        # 第三步：為每個組創建PDF文件
+        status_text.text("正在合併連續相同代碼的頁面...")
+        
+        for group_index, group in enumerate(page_groups):
+            # 更新進度 - 這部分占總進度的另一半
+            progress = 0.5 + ((group_index + 1) / (len(page_groups) * 2))  # 從50%到100%
+            progress_bar.progress(progress)
+            
+            if not group:
                 continue
             
-            code = code_info.get('code')
+            code = group[0]['code']
+            first_page_text = group[0]['text']
             
             # 生成文件名
-            page_text = code_info.get('text', '')
-            filename = f"{generate_filename(code, page_text)}.pdf"
+            base_filename = generate_filename(code, first_page_text)
             
-            # 創建單頁PDF
-            unique_filename = f"{filename.replace('.pdf', '')}_{int(time.time())}_{page_num}.pdf"
-            output_path = os.path.join("output", unique_filename)
-            os.makedirs("output", exist_ok=True)
+            # 如果有多個相同代碼的組，添加組號
+            filename = f"{base_filename}.pdf"
             
+            # 創建一個新的PDF
             pdf_writer = PdfWriter()
             reader = PdfReader(temp_path)
-            pdf_writer.add_page(reader.pages[page_num])
+            
+            # 添加組中的所有頁面
+            for page_info in group:
+                pdf_writer.add_page(reader.pages[page_info['page_num']])
+            
+            # 保存到臨時文件
+            output_path = os.path.join("output", f"temp_{time.time()}.pdf")
+            os.makedirs("output", exist_ok=True)
             
             with open(output_path, 'wb') as output_file:
                 pdf_writer.write(output_file)
@@ -349,11 +421,18 @@ def process_pdf(uploaded_file, progress_bar, status_text):
             st.session_state.generated_files.append({
                 'filename': filename,
                 'content': file_content,
-                'page_number': page_num,
+                'pages': [p['page_num'] for p in group],
                 'code': code,
-                'method': code_info.get('method', 'text_rule'),
-                'confidence': code_info.get('confidence', 'medium')
+                'page_count': len(group),
+                'method': group[0].get('method', 'text_rule'),
+                'confidence': group[0].get('confidence', 'medium')
             })
+            
+            # 刪除臨時文件
+            try:
+                os.remove(output_path)
+            except:
+                pass
             
             # 暫停一下，確保界面更新
             time.sleep(0.1)
@@ -394,6 +473,13 @@ with st.sidebar:
     st.markdown("2. 點擊「處理PDF」按鈕")
     st.markdown("3. 等待處理完成")
     st.markdown("4. 下載拆分後的文件")
+    
+    # 顯示功能說明
+    st.markdown("---")
+    st.subheader("功能說明")
+    st.markdown("- 連續的相同代碼頁面會自動合併為一個PDF文件")
+    st.markdown("- 不同代碼的頁面會分開成獨立的PDF文件")
+    st.markdown("- 摘要頁面會被自動忽略")
     
     # 顯示API配置狀態
     st.markdown("---")
@@ -494,7 +580,8 @@ if st.session_state.processing_complete and st.session_state.generated_files:
                 col1, col2 = st.columns([4, 1])
                 with col1:
                     # 使用按鈕作為點擊預覽的方式
-                    if st.button(f"{file['filename']} (第{file['page_number']+1}頁)", key=f"file_{file_idx}", use_container_width=True):
+                    page_range = f"第{min(file['pages'])+1}-{max(file['pages'])+1}頁" if len(file['pages']) > 1 else f"第{file['pages'][0]+1}頁"
+                    if st.button(f"{file['filename']} ({page_range}, 共{file['page_count']}頁)", key=f"file_{file_idx}", use_container_width=True):
                         set_preview_file(file_idx)
                 with col2:
                     st.download_button(
@@ -524,10 +611,17 @@ if st.session_state.processing_complete and st.session_state.generated_files:
             
             try:
                 doc = fitz.open(temp_path)
-                page = doc[0]
-                pix = page.get_pixmap(matrix=fitz.Matrix(0.8, 0.8))
-                img_data = pix.tobytes("png")
-                st.image(img_data, caption=file['filename'])
+                # 如果文件頁數超過5頁，只預覽前5頁
+                max_preview_pages = min(5, doc.page_count)
+                
+                st.write(f"預覽前 {max_preview_pages} 頁 (共 {doc.page_count} 頁):")
+                
+                for page_idx in range(max_preview_pages):
+                    page = doc[page_idx]
+                    pix = page.get_pixmap(matrix=fitz.Matrix(0.8, 0.8))
+                    img_data = pix.tobytes("png")
+                    st.image(img_data, caption=f"第 {page_idx+1} 頁")
+                
                 doc.close()
             except Exception as e:
                 st.error(f"顯示預覽時出錯")
