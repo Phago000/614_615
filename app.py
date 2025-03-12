@@ -1,7 +1,6 @@
 import streamlit as st
 import os
-from PyPDF2 import PdfReader, PdfWriter
-import fitz
+import fitz  # PyMuPDF
 import tempfile
 import time
 import re
@@ -378,7 +377,7 @@ def process_pdf(uploaded_file, progress_bar, status_text):
         if current_group:
             page_groups.append(current_group)
         
-        # 第三步：為每個組創建PDF文件
+        # 第三步：為每個組創建PDF文件，確保Adobe兼容性
         status_text.text("正在合併連續相同代碼的頁面...")
         
         for group_index, group in enumerate(page_groups):
@@ -394,27 +393,38 @@ def process_pdf(uploaded_file, progress_bar, status_text):
             
             # 生成文件名
             base_filename = generate_filename(code, first_page_text)
-            
-            # 如果有多個相同代碼的組，添加組號
             filename = f"{base_filename}.pdf"
             
-            # 創建一個新的PDF
-            pdf_writer = PdfWriter()
-            reader = PdfReader(temp_path)
+            # 使用PyMuPDF (fitz) 創建新的PDF，而不是PyPDF2
+            # 這樣可以確保更好的Adobe兼容性
+            temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+            temp_output.close()
+            
+            # 打開源PDF
+            source_doc = fitz.open(temp_path)
+            # 創建新的PDF文檔
+            output_doc = fitz.open()
             
             # 添加組中的所有頁面
             for page_info in group:
-                pdf_writer.add_page(reader.pages[page_info['page_num']])
+                page_num = page_info['page_num']
+                output_doc.insert_pdf(source_doc, from_page=page_num, to_page=page_num)
             
-            # 保存到臨時文件
-            output_path = os.path.join("output", f"temp_{time.time()}.pdf")
-            os.makedirs("output", exist_ok=True)
+            # 保存到臨時文件，使用更多Adobe兼容的設置
+            output_doc.save(
+                temp_output.name,
+                garbage=4,  # 最大垃圾收集
+                clean=True,  # 清理未使用的對象
+                deflate=True,  # 使用deflate壓縮
+                pretty=False,  # 不使用美化格式（減少文件大小）
+                linear=True,  # 線性化PDF以便於Web瀏覽
+            )
             
-            with open(output_path, 'wb') as output_file:
-                pdf_writer.write(output_file)
+            output_doc.close()
+            source_doc.close()
             
             # 讀取生成的文件內容
-            with open(output_path, 'rb') as file:
+            with open(temp_output.name, 'rb') as file:
                 file_content = file.read()
             
             # 添加到生成的文件列表
@@ -430,7 +440,7 @@ def process_pdf(uploaded_file, progress_bar, status_text):
             
             # 刪除臨時文件
             try:
-                os.remove(output_path)
+                os.remove(temp_output.name)
             except:
                 pass
             
@@ -480,6 +490,11 @@ with st.sidebar:
     st.markdown("- 連續的相同代碼頁面會自動合併為一個PDF文件")
     st.markdown("- 不同代碼的頁面會分開成獨立的PDF文件")
     st.markdown("- 摘要頁面會被自動忽略")
+    
+    # 顯示瀏覽器兼容性提示
+    st.markdown("---")
+    st.subheader("兼容性說明")
+    st.info("如果您在Adobe查看器中遇到顯示問題，請嘗試使用Chrome或Edge瀏覽器打開生成的文件")
     
     # 顯示API配置狀態
     st.markdown("---")
@@ -543,6 +558,10 @@ if uploaded_file is not None:
             # 完成處理
             progress_bar.progress(1.0)
             status_text.text(f"處理完成! 已生成 {len(generated_files)} 個文件。")
+            
+            if len(generated_files) > 0:
+                st.success("✓ 處理成功! 請點擊下方的下載按鈕獲取處理後的文件。")
+                st.info("💡 提示: 如果在Adobe中查看文件有問題，請嘗試使用Chrome或Edge打開。")
 
 # 如果處理已完成且有文件，顯示結果
 if st.session_state.processing_complete and st.session_state.generated_files:
