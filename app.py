@@ -34,7 +34,7 @@ if 'selected_file_for_preview' not in st.session_state:
     st.session_state.selected_file_for_preview = None
 
 # 常見機構代碼
-COMMON_CODES = {'OFS', 'WMG', 'WCL', 'DOL', 'LNI', 'DFW', 'DOR', 'ECY', 'WSP', 'DOH'}
+COMMON_CODES = {'OFS', 'WMG', 'WCL', 'DOL', 'LNI', 'DFW', 'DOR', 'ECY', 'WSP', 'DOH', 'FPL', 'IPP'}
 
 # 添加日誌消息函數（僅內部使用，不顯示在UI上）
 def add_log(message, level="info"):
@@ -59,44 +59,52 @@ def check_rate_limit():
     
     st.session_state.api_calls_count += 1
 
-# 文本提取代碼函數
+# 文本提取代碼函數 (MODIFIED FOR BETTER ACCURACY)
 def extract_code_from_text(text):
-    """從文本中提取機構代碼"""
+    """
+    從文本中提取機構代碼 - 針對 Rpt_614 格式進行了優化。
+    此版本會優先檢查報表標題。
+    """
     if not text:
         return None
     
-    # 標準化文本
-    text = ' '.join(text.split()).upper()
-    
-    # 直接檢查高優先度代碼
-    if 'OFS' in text:
-        return 'OFS'
-    
-    if 'WMG' in text:
-        return 'WMG'
-    
-    if 'WCL' in text:
-        return 'WCL'
-    
-    # 常用模式
-    patterns = [
-        # Print Date後的三字母代碼
-        r'PRINT DATE : \d{2} [A-Z]{3} \d{4}\s+([A-Z]{3})\s+PRINT TIME',
-        # Agency或Code後的代碼
-        r'(?:AGENCY|DEPT|CODE)[:\s]*([A-Z]{3})',
-        # WA Code後的代碼
-        r'WA CODE\s+([A-Z]{3})'
+    # 標準化文本以便匹配
+    upper_text = ' '.join(text.split()).upper()
+
+    # 規則 1: 優先從報表標題中提取代碼 (最可靠的來源)
+    # 匹配 "Outstanding Fees Report XXX" 或 "WCL/WMG Outstanding Fees Report"
+    title_patterns = [
+        r'(?:OUTSTANDING FEES REPORT|FEES REPORT)\s+([A-Z]{3})',
+        r'([A-Z]{3})\s+OUTSTANDING FEES REPORT'
     ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, text)
-        if matches:
-            code = matches[0]
-            if code not in ['PDF', 'THE', 'AND', 'ALL', 'FOR']:
+    for pattern in title_patterns:
+        match = re.search(pattern, upper_text)
+        if match:
+            code = match.group(1)
+            if code not in ['THE', 'AND', 'ALL', 'FOR', 'CTS']:
+                add_log(f"文本規則：從標題找到代碼 '{code}'")
                 return code
-    
+
+    # 規則 2: 從 WA Code 數據列中提取 (第二可靠的來源)
+    # 匹配換行符後的 "FPL007", "IPP021" 等格式
+    wa_code_match = re.search(r'\n([A-Z]{3})\d+\s', text)
+    if wa_code_match:
+        code = wa_code_match.group(1)
+        add_log(f"文本規則：從WA Code列找到代碼 '{code}'")
+        return code
+
+    # 規則 3: 檢查高優先度代碼是否單獨存在於頁面頂部
+    if 'OFS' in upper_text[:300]: # 只搜索文件開頭部分
+        return 'OFS'
+    if 'WMG' in upper_text[:300]:
+        return 'WMG'
+    if 'WCL' in upper_text[:300]:
+        return 'WCL'
+
+    # 如果以上規則都失敗，返回 None
     return None
 
+# AI調用函數 (UNCHANGED)
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -114,102 +122,108 @@ def make_api_call(model, prompt, image):
             time.sleep(5)
         raise e
 
+# 核心識別函數 (MODIFIED FOR BETTER ACCURACY)
 def extract_code_with_ai(pdf_path, page_number, api_key, status_text):
-    """使用AI識別代碼"""
+    """
+    使用增強的AI和決策邏輯識別代碼 - 針對 Rpt_614 格式進行了特別優化。
+    """
+    doc = None
+    page_text = ""
+    text_extracted_code = None
+    
     try:
-        # 第一步：從文本中提取代碼
+        # 步驟 1: 使用優化後的文本規則提取
         doc = fitz.open(pdf_path)
         page = doc[page_number]
         page_text = page.get_text()
         doc.close()
-        
-        # 使用文本規則提取代碼
         text_extracted_code = extract_code_from_text(page_text)
+
+        # 如果文本規則找到了可靠的代碼，並且沒有API密鑰，直接返回
+        if text_extracted_code and not api_key:
+            add_log(f"第 {page_number+1} 頁: 無API密鑰，使用文本規則找到 '{text_extracted_code}'。")
+            return {"code": text_extracted_code, "method": "text_rule_only", "confidence": "high", "text": page_text}
         
-        # 如果規則方法找到高可信度代碼（如OFS、WMG），直接返回
-        if text_extracted_code in ['OFS', 'WMG', 'WCL']:
-            add_log(f"第 {page_number+1} 頁: 文本規則找到高可信度代碼 {text_extracted_code}")
-            return {"code": text_extracted_code, "method": "text_rule", "confidence": "high", "text": page_text}
-        
-        # 如果沒有API密鑰，但有文本提取結果，則使用文本結果
-        if not api_key and text_extracted_code:
-            return {"code": text_extracted_code, "method": "text_rule", "confidence": "medium", "text": page_text}
-        
-        # 如果沒有API密鑰且沒有文本提取結果，返回未知
+        # 如果沒有API密鑰且文本規則失敗，返回未知
         if not api_key:
-            return {"code": "UNK", "method": "text_rule", "confidence": "low", "text": page_text}
-        
-        # 使用AI模型識別
+            return {"code": "UNK", "method": "text_rule_only", "confidence": "low", "text": page_text}
+
+        # 步驟 2: 準備並調用AI模型
+        status_text.text(f"正在使用AI增強分析第 {page_number+1} 頁...")
         page_image = convert_pdf_to_image(pdf_path, page_number)
+
         if not page_image:
-            # 如果無法創建圖像，使用文本結果
-            if text_extracted_code:
-                return {"code": text_extracted_code, "method": "text_rule", "confidence": "medium", "text": page_text}
-            return {"code": "UNK", "method": "text_rule", "confidence": "low", "text": page_text}
-        
-        # 配置Gemini API
-        status_text.text(f"正在分析第 {page_number+1} 頁...")
-        
+            code = text_extracted_code if text_extracted_code else "UNK"
+            return {"code": code, "method": "text_rule_fallback", "confidence": "medium" if code != "UNK" else "low", "text": page_text}
+
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
         
-        prompt = """Analyze this document image carefully.
-        Task: Find the 3-letter agency/department code typically located at the top of the document.
-        
-        Important details:
-        - Look specifically for 'OFS' or 'OFFICE OF FINANCIAL SERVICES'
-        - Look specifically for 'WMG' after the PRINT DATE
-        - Look specifically for 'WCL' in the document header
-        - The code is exactly 3 capital letters
-        - Common locations: header, top-right, or after "Agency:", "Code:", or "Dept:"
-        - Common codes include: OFS (Office of Financial Services), WMG, WCL
-        - Ignore common words like "THE", "AND", "ALL", "PDF", "REC"
-        - If multiple codes appear, choose the most prominent one
-        - If you see 'OFFICE OF FINANCIAL SERVICES' or 'OFS', return 'OFS'
-        - If no valid code is found, return "UNK"
-        
-        RETURN EXACTLY (no explanation):
+        # --- 針對 Rpt_614 的高度優化AI提示 ---
+        prompt = """You are a highly specialized document analyst for financial reports. Your task is to find the single, correct 3-letter agency code on this page.
+
+        This document format has very specific rules:
+        1.  **Primary Location:** The code is almost always in the main report title at the top of the page. Examples: "Outstanding Fees Report FPL", "WCL Outstanding Fees Report", "Outstanding Fees Report OFS".
+        2.  **Secondary Location:** Look at the "WA Code" column. The data in it (e.g., "FPL007", "IPP021") contains the code.
+        3.  **CRITICAL - WHAT TO IGNORE:**
+            -   **DO NOT** use "WHK". "WHK" is part of the "Account No." and is NOT the agency code. Ignore it completely.
+            -   **DO NOT** use "ALL". This is a filter value, not a code.
+            -   **DO NOT** use month abbreviations (JAN, FEB, etc.) or currency codes (HKD, USD).
+        4.  The code is always exactly 3 capital letters (e.g., FPL, IPP, OFS, WCL, WMG).
+
+        Analyze the document and return the single most likely code. If no valid code can be found according to these rules, return "UNK".
+
+        Return your answer in a strict JSON format with NO other text or explanation:
         {
             "code": "XXX"
         }
-        where XXX is the 3-letter code you found or "UNK" if none found."""
+        """
         
         response = make_api_call(model, prompt, page_image)
         
-        json_str = response.text
+        # 解析AI響應
+        ai_code = "UNK"
+        try:
+            json_str = response.text
+            if '```json' in json_str:
+                json_str = json_str.split('```json')[1].split('```')
+            elif '```' in json_str:
+                json_str = json_str.split('```').split('```')[0]
+            
+            ai_results = json.loads(json_str.strip())
+            ai_code = ai_results.get('code', 'UNK').upper()
+        except Exception as e:
+            add_log(f"第 {page_number+1} 頁: AI響應解析失敗: {e}", "error")
+            ai_code = "UNK" # 標記AI失敗
+
+        # 步驟 3: 最終決策
+        # 由於新的文本規則非常針對此文件格式，我們給予它最高優先級。
+        # AI主要用於確認或處理掃描件等邊界情況。
         
-        # 解析JSON響應
-        if '```json' in json_str:
-            json_str = json_str.split('```json')[1].split('```')[0]
-        elif '```' in json_str:
-            json_str = json_str.split('```')[1].split('```')[0]
-        
-        ai_results = json.loads(json_str.strip())
-        ai_code = ai_results.get('code', 'UNK')
-        
-        # 第三步：結合兩種方法結果
-        if ai_code == 'UNK' and text_extracted_code:
-            return {"code": text_extracted_code, "method": "text_rule", "confidence": "medium", "text": page_text}
-        
-        if ai_code != 'UNK' and text_extracted_code and ai_code != text_extracted_code:
-            # 如果兩種方法結果不一致
-            if text_extracted_code in ['OFS', 'WMG', 'WCL']:
-                return {"code": text_extracted_code, "method": "combined", "confidence": "high", "text": page_text}
-            # 否則信任AI結果
-            return {"code": ai_code, "method": "ai", "confidence": "high", "text": page_text}
-        
-        # 如果AI找到結果，信任它
-        if ai_code != 'UNK':
-            return {"code": ai_code, "method": "ai", "confidence": "high", "text": page_text}
-        
-        # 如果都沒找到
-        return {"code": "UNK", "method": "combined", "confidence": "low", "text": page_text}
-        
+        if text_extracted_code:
+            add_log(f"第 {page_number+1} 頁: 決策 - 信任優化後的文本規則結果 '{text_extracted_code}'。")
+            final_code = text_extracted_code
+            method = "text_rule_optimized"
+            confidence = "high"
+        elif ai_code != "UNK":
+            add_log(f"第 {page_number+1} 頁: 決策 - 文本規則失敗，使用AI結果 '{ai_code}'。")
+            final_code = ai_code
+            method = "ai_fallback"
+            confidence = "medium"
+        else:
+            add_log(f"第 {page_number+1} 頁: 決策 - 所有方法均失敗。")
+            final_code = "UNK"
+            method = "combined_failure"
+            confidence = "low"
+            
+        return {"code": final_code, "method": method, "confidence": confidence, "text": page_text}
+
     except Exception as e:
-        # 發生錯誤時，返回文本方法提取的代碼（如果有）
-        if 'text_extracted_code' in locals() and text_extracted_code:
-            return {"code": text_extracted_code, "method": "text_rule_fallback", "confidence": "low", "text": page_text if 'page_text' in locals() else ""}
-        return {"code": "UNK", "method": "error", "confidence": "low", "text": page_text if 'page_text' in locals() else ""}
+        add_log(f"第 {page_number+1} 頁處理時發生嚴重錯誤: {str(e)}", "error")
+        # 在發生錯誤時，仍然嘗試返回基於文本的結果
+        if text_extracted_code:
+            return {"code": text_extracted_code, "method": "error_fallback_text", "confidence": "low", "text": page_text}
+        return {"code": "UNK", "method": "error", "confidence": "low", "text": page_text}
 
 def convert_pdf_to_image(pdf_path, page_num):
     """將PDF頁面轉換為圖像 - 增強清晰度版本"""
