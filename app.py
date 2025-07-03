@@ -19,7 +19,7 @@ except Exception:
 
 # Blocklist of common 3-letter words to prevent false positives
 BLOCKLIST = {
-    'THE', 'AND', 'ALL', 'FOR', 'CTS', 'USD', 'HKD', 'MFG', 
+    'THE', 'AND', 'ALL', 'FOR', 'CTS', 'USD', 'HKD', 'MFG',
     'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC', 'PRI'
 }
 
@@ -41,28 +41,29 @@ def add_log(message, level="info"):
     timestamp = time.strftime("%H:%M:%S")
     st.session_state.log_messages.append({"timestamp": timestamp, "message": message, "level": level})
 
+# THIS IS THE MISSING FUNCTION THAT CAUSED THE CRASH
+def set_preview_file(file_index):
+    """Sets the file to be displayed in the preview pane."""
+    st.session_state.selected_file_for_preview = file_index
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), reraise=True)
 def make_api_call(model, prompt, image):
     return model.generate_content([prompt, image], generation_config=genai.types.GenerationConfig(temperature=0))
 
-# --- CORE IDENTIFICATION LOGIC (REBUILT FOR ACCURACY) ---
+# --- CORE IDENTIFICATION LOGIC ---
 
 def extract_code_with_rules(text):
     """
     Extracts the agency code using a prioritized set of robust rules.
-    THIS IS THE NEW, SMARTER TEXT-BASED FUNCTION.
     """
     if not text:
         return None
 
-    # Rule 1: Find a 3-letter code at the very top-left of the page.
-    # This is the most reliable pattern for Rpt_615.
     first_line = text.split('\n', 1)[0].strip()
     if len(first_line) == 3 and first_line.isupper() and first_line not in BLOCKLIST:
         add_log(f"Rule 1 (Top-Left Code) found: '{first_line}'")
         return first_line
 
-    # Rule 2: Find the code in the "WA Code" column (reliable backup).
     wa_code_match = re.search(r'\b([A-Z]{3})\d{3,}\b', text)
     if wa_code_match:
         code = wa_code_match.group(1)
@@ -70,7 +71,6 @@ def extract_code_with_rules(text):
             add_log(f"Rule 2 (WA Code Column) found: '{code}'")
             return code
             
-    # Rule 3: Find code in a report title (for other report formats).
     title_pattern = r'(?:RECEIVED|OUTSTANDING)\s+FEES\s+REPORT\s+([A-Z]{3})'
     title_match = re.search(title_pattern, text.upper().replace('\n', ' '))
     if title_match:
@@ -83,8 +83,7 @@ def extract_code_with_rules(text):
 
 def extract_code_with_ai(pdf_path, page_number, api_key, status_text):
     """
-    Main identification function. It now heavily relies on the superior rule-based
-    method and only uses AI as a last resort.
+    Main identification function. Relies on rules first, AI as a fallback.
     """
     doc = None
     try:
@@ -92,15 +91,12 @@ def extract_code_with_ai(pdf_path, page_number, api_key, status_text):
         page = doc[page_number]
         page_text = page.get_text()
 
-        # Step 1: Use the new, powerful rule-based extraction first.
         rule_based_code = extract_code_with_rules(page_text)
 
-        # Step 2: Decision - If the rules found a code, we are DONE. Trust it.
         if rule_based_code:
             add_log(f"Page {page_number+1}: Trusting high-confidence rule-based result '{rule_based_code}'.")
             return {"code": rule_based_code, "method": "rules_optimized", "confidence": "high", "text": page_text}
 
-        # Step 3: If rules failed AND we have an API key, use AI as a fallback.
         if api_key:
             status_text.text(f"Rules failed for page {page_number+1}. Using AI analysis as a fallback...")
             page_image = convert_pdf_to_image(pdf_path, page_number)
@@ -137,14 +133,13 @@ def extract_code_with_ai(pdf_path, page_number, api_key, status_text):
             except Exception as e:
                 return {"code": "UNKNOWN", "method": "ai_error", "confidence": "low", "text": page_text}
 
-        # If rules fail and there's no API key, mark as unknown.
         return {"code": "UNKNOWN", "method": "rules_failed_no_api", "confidence": "low", "text": page_text}
 
     finally:
         if doc:
             doc.close()
 
-# --- UTILITY AND PROCESSING FUNCTIONS (UNCHANGED BUT INCLUDED FOR COMPLETENESS) ---
+# --- UTILITY AND PROCESSING FUNCTIONS ---
 
 def convert_pdf_to_image(pdf_path, page_num):
     doc = None
@@ -332,7 +327,6 @@ if st.session_state.processing_complete and st.session_state.generated_files:
             use_container_width=True
         )
     
-    # UI for displaying files and previews
     col1, col2 = st.columns(2)
 
     with col1:
@@ -348,6 +342,7 @@ if st.session_state.processing_complete and st.session_state.generated_files:
                 for file_idx, file in files:
                     c1, c2 = st.columns([3,1])
                     page_range = f"Pgs {min(file['pages'])+1}-{max(file['pages'])+1}" if len(file['pages']) > 1 else f"Pg {file['pages'][0]+1}"
+                    # THIS LINE NOW WORKS BECAUSE set_preview_file IS DEFINED
                     c1.button(f"📄 {file['filename']} ({page_range})", key=f"preview_{file_idx}", on_click=set_preview_file, args=(file_idx,), use_container_width=True)
                     with c2:
                         st.download_button("Save", file['content'], file['filename'], "application/pdf", key=f"dl_{file_idx}", use_container_width=True)
@@ -361,7 +356,7 @@ if st.session_state.processing_complete and st.session_state.generated_files:
             try:
                 doc = fitz.open(stream=file['content'], filetype="pdf")
                 for i, page in enumerate(doc):
-                    if i >= 3: # Limit preview to first 3 pages
+                    if i >= 3:
                         st.write(f"...and {doc.page_count - i} more pages.")
                         break
                     pix = page.get_pixmap(dpi=150)
