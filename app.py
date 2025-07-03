@@ -35,13 +35,11 @@ if 'selected_file_for_preview' not in st.session_state:
 if 'zip_data' not in st.session_state:
     st.session_state.zip_data = None
 
-
 # --- HELPER FUNCTIONS ---
 def add_log(message, level="info"):
     timestamp = time.strftime("%H:%M:%S")
     st.session_state.log_messages.append({"timestamp": timestamp, "message": message, "level": level})
 
-# THIS IS THE MISSING FUNCTION THAT CAUSED THE CRASH
 def set_preview_file(file_index):
     """Sets the file to be displayed in the preview pane."""
     st.session_state.selected_file_for_preview = file_index
@@ -50,40 +48,49 @@ def set_preview_file(file_index):
 def make_api_call(model, prompt, image):
     return model.generate_content([prompt, image], generation_config=genai.types.GenerationConfig(temperature=0))
 
-# --- CORE IDENTIFICATION LOGIC ---
+# --- THE FINAL, ROBUST IDENTIFICATION LOGIC ---
 
-def extract_code_with_rules(text):
+def extract_code_with_hybrid_rules(text):
     """
-    Extracts the agency code using a prioritized set of robust rules.
+    Extracts the agency code using a prioritized engine of robust rules.
+    This handles multiple report formats correctly.
     """
     if not text:
         return None
 
-    first_line = text.split('\n', 1)[0].strip()
-    if len(first_line) == 3 and first_line.isupper() and first_line not in BLOCKLIST:
-        add_log(f"Rule 1 (Top-Left Code) found: '{first_line}'")
-        return first_line
-
-    wa_code_match = re.search(r'\b([A-Z]{3})\d{3,}\b', text)
-    if wa_code_match:
-        code = wa_code_match.group(1)
-        if code not in BLOCKLIST:
-            add_log(f"Rule 2 (WA Code Column) found: '{code}'")
-            return code
-            
-    title_pattern = r'(?:RECEIVED|OUTSTANDING)\s+FEES\s+REPORT\s+([A-Z]{3})'
+    # Rule 1: Check for code in the report title first (e.g., "Received Fees Report FPL").
+    # This is a very high-confidence pattern.
+    title_pattern = r'(?:OUTSTANDING|RECEIVED)\s+FEES\s+REPORT\s+([A-Z]{3})'
+    # Replace newlines with spaces to handle titles that might wrap across lines
     title_match = re.search(title_pattern, text.upper().replace('\n', ' '))
     if title_match:
         code = title_match.group(1)
         if code not in BLOCKLIST:
-            add_log(f"Rule 3 (Report Title) found: '{code}'")
+            add_log(f"Rule 1 (Title Match) found: '{code}'")
+            return code
+
+    # Rule 2: If no title match, check for a standalone code at the top-left.
+    # This handles the Rpt_615 format.
+    first_line = text.split('\n', 1)[0].strip()
+    if len(first_line) == 3 and first_line.isupper() and first_line not in BLOCKLIST:
+        add_log(f"Rule 2 (Top-Left Code) found: '{first_line}'")
+        return first_line
+
+    # Rule 3: As a final text-based fallback, check the WA Code column.
+    wa_code_match = re.search(r'\b([A-Z]{3})\d{3,}\b', text)
+    if wa_code_match:
+        code = wa_code_match.group(1)
+        if code not in BLOCKLIST:
+            add_log(f"Rule 3 (WA Code Column) found: '{code}'")
             return code
             
+    # If all text-based rules fail, return None.
     return None
 
-def extract_code_with_ai(pdf_path, page_number, api_key, status_text):
+def extract_code_master_controller(pdf_path, page_number, api_key, status_text):
     """
-    Main identification function. Relies on rules first, AI as a fallback.
+    The main identification controller. It uses the hybrid rule engine first
+    and only calls the AI if the rules fail.
     """
     doc = None
     try:
@@ -91,14 +98,17 @@ def extract_code_with_ai(pdf_path, page_number, api_key, status_text):
         page = doc[page_number]
         page_text = page.get_text()
 
-        rule_based_code = extract_code_with_rules(page_text)
+        # Step 1: Use the new, powerful hybrid rule engine.
+        rule_based_code = extract_code_with_hybrid_rules(page_text)
 
+        # Step 2: Decision - If the rules found a code, we are DONE. Trust it.
         if rule_based_code:
             add_log(f"Page {page_number+1}: Trusting high-confidence rule-based result '{rule_based_code}'.")
-            return {"code": rule_based_code, "method": "rules_optimized", "confidence": "high", "text": page_text}
+            return {"code": rule_based_code, "method": "hybrid_rules", "confidence": "high", "text": page_text}
 
+        # Step 3: If all rules failed AND we have an API key, use AI as a last resort.
         if api_key:
-            status_text.text(f"Rules failed for page {page_number+1}. Using AI analysis as a fallback...")
+            status_text.text(f"Rules failed for page {page_number+1}. Using AI analysis as a final fallback...")
             page_image = convert_pdf_to_image(pdf_path, page_number)
 
             if not page_image:
@@ -133,6 +143,7 @@ def extract_code_with_ai(pdf_path, page_number, api_key, status_text):
             except Exception as e:
                 return {"code": "UNKNOWN", "method": "ai_error", "confidence": "low", "text": page_text}
 
+        # If rules fail and there's no API key, mark as unknown.
         return {"code": "UNKNOWN", "method": "rules_failed_no_api", "confidence": "low", "text": page_text}
 
     finally:
@@ -202,7 +213,8 @@ def process_pdf(uploaded_file, progress_bar, status_text):
                 page_codes.append({'page_num': page_num, 'code': 'SUMMARY', 'text': page_text})
                 continue
             
-            code_info = extract_code_with_ai(temp_path, page_num, GEMINI_API_KEY, status_text)
+            # Call the main controller function
+            code_info = extract_code_master_controller(temp_path, page_num, GEMINI_API_KEY, status_text)
             page_codes.append({
                 'page_num': page_num,
                 'code': code_info.get('code', 'UNKNOWN'),
@@ -310,9 +322,9 @@ if uploaded_file is not None:
             
             progress_bar.progress(1.0)
             if generated_files:
-                status_text.success(f"Processing complete! {len(generated_files)} files were generated.")
+                st.success(f"Processing complete! {len(generated_files)} files were generated.")
             else:
-                status_text.error("Processing finished, but no files were generated. Please check the PDF content or errors above.")
+                st.error("Processing finished, but no files were generated. Please check the PDF content or errors above.")
 
 if st.session_state.processing_complete and st.session_state.generated_files:
     st.divider()
@@ -342,7 +354,6 @@ if st.session_state.processing_complete and st.session_state.generated_files:
                 for file_idx, file in files:
                     c1, c2 = st.columns([3,1])
                     page_range = f"Pgs {min(file['pages'])+1}-{max(file['pages'])+1}" if len(file['pages']) > 1 else f"Pg {file['pages'][0]+1}"
-                    # THIS LINE NOW WORKS BECAUSE set_preview_file IS DEFINED
                     c1.button(f"📄 {file['filename']} ({page_range})", key=f"preview_{file_idx}", on_click=set_preview_file, args=(file_idx,), use_container_width=True)
                     with c2:
                         st.download_button("Save", file['content'], file['filename'], "application/pdf", key=f"dl_{file_idx}", use_container_width=True)
