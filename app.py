@@ -11,22 +11,13 @@ import google.generativeai as genai
 import json
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# --- CONFIGURATION ---
-
-# Attempt to get the API key from Streamlit secrets
+# 嘗試從Streamlit secrets獲取API密鑰
 try:
     GEMINI_API_KEY = st.secrets["gemini"]["api_key"]
 except Exception:
-    GEMINI_API_KEY = ""  # Use an empty string if not found
+    GEMINI_API_KEY = ""  # 如果無法從secrets獲取，則使用空字串
 
-# A blocklist of common 3-letter words to ignore to prevent false positives.
-BLOCKLIST = {
-    'THE', 'AND', 'ALL', 'FOR', 'CTS', 'USD', 'HKD', 'MFG', 
-    'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'
-}
-
-# --- SESSION STATE INITIALIZATION ---
-
+# 初始化會話狀態
 if 'generated_files' not in st.session_state:
     st.session_state.generated_files = []
 if 'log_messages' not in st.session_state:
@@ -42,10 +33,12 @@ if 'processing_complete' not in st.session_state:
 if 'selected_file_for_preview' not in st.session_state:
     st.session_state.selected_file_for_preview = None
 
-# --- HELPER AND CORE FUNCTIONS ---
+# 常見機構代碼
+COMMON_CODES = {'OFS', 'WMG', 'WCL', 'DOL', 'LNI', 'DFW', 'DOR', 'ECY', 'WSP', 'DOH', 'FPL', 'IPP'}
 
+# 添加日誌消息函數（僅內部使用，不顯示在UI上）
 def add_log(message, level="info"):
-    """Adds a log message to the session state for debugging."""
+    """添加日誌消息到會話狀態"""
     timestamp = time.strftime("%H:%M:%S")
     st.session_state.log_messages.append({
         "timestamp": timestamp,
@@ -54,197 +47,215 @@ def add_log(message, level="info"):
     })
 
 def check_rate_limit():
-    """Checks the API call rate limit to avoid errors."""
+    """檢查API速率限制"""
     current_time = time.time()
-    if current_time - st.session_state.last_reset_time >= 60:
+    if current_time - st.session_state.last_reset_time >= 60:  # 60秒重置
         st.session_state.api_calls_count = 0
         st.session_state.last_reset_time = current_time
     
-    if st.session_state.api_calls_count >= 60:
-        raise Exception("API rate limit exceeded. Please wait a moment.")
+    if st.session_state.api_calls_count >= 60:  # 每分鐘最多60次
+        remaining_time = 60 - (current_time - st.session_state.last_reset_time)
+        raise Exception(f"超過API速率限制，請稍後再試。")
     
     st.session_state.api_calls_count += 1
 
-# --- MODIFIED CORE LOGIC ---
-
-def extract_code_with_rules(text):
+# 文本提取代碼函數 (Original Version)
+def extract_code_from_text(text):
     """
-    Extracts the agency code from page text using a prioritized set of rules.
-    This is the primary, high-accuracy method.
+    從文本中提取機構代碼 - 針對 Rpt_614 格式進行了優化。
+    此版本會優先檢查報表標題。
     """
     if not text:
         return None
+    
+    # 標準化文本以便匹配
+    upper_text = ' '.join(text.split()).upper()
 
-    # Rule 1: Find a 3-letter code at the top-left of the page (most reliable for Rpt_615).
-    # It's usually one of the first words in the document.
-    lines = text.split('\n')
-    if lines:
-        first_line_words = lines[0].strip().split()
-        if first_line_words and len(first_line_words[0]) == 3 and first_line_words[0].isupper() and first_line_words[0] not in BLOCKLIST:
-            code = first_line_words[0]
-            add_log(f"Rule 1 (Top-Left Code): Found '{code}'")
-            return code
+    # 規則 1: 優先從報表標題中提取代碼 (最可靠的來源)
+    # 匹配 "Outstanding Fees Report XXX" 或 "WCL/WMG Outstanding Fees Report"
+    title_patterns = [
+        r'(?:OUTSTANDING FEES REPORT|FEES REPORT)\s+([A-Z]{3})',
+        r'([A-Z]{3})\s+OUTSTANDING FEES REPORT'
+    ]
+    for pattern in title_patterns:
+        match = re.search(pattern, upper_text)
+        if match:
+            code = match.group(1)
+            if code not in ['THE', 'AND', 'ALL', 'FOR', 'CTS']:
+                add_log(f"文本規則：從標題找到代碼 '{code}'")
+                return code
 
-    # Rule 2: Find the code in the "WA Code" column (reliable backup).
-    # Pattern looks for a 3-letter code followed by numbers, as a whole word.
-    wa_code_match = re.search(r'\b([A-Z]{3})\d{3,}\b', text)
+    # 規則 2: 從 WA Code 數據列中提取 (第二可靠的來源)
+    # 匹配換行符後的 "FPL007", "IPP021" 等格式
+    wa_code_match = re.search(r'\n([A-Z]{3})\d+\s', text)
     if wa_code_match:
         code = wa_code_match.group(1)
-        if code not in BLOCKLIST:
-            add_log(f"Rule 2 (WA Code Column): Found '{code}'")
-            return code
+        add_log(f"文本規則：從WA Code列找到代碼 '{code}'")
+        return code
 
-    # Rule 3: Find the code in the report title (handles Rpt_614 and other formats).
-    title_pattern = r'(?:RECEIVED|OUTSTANDING)\s+FEES\s+REPORT\s+([A-Z]{3})'
-    title_match = re.search(title_pattern, text.upper().replace('\n', ' '))
-    if title_match:
-        code = title_match.group(1)
-        if code not in BLOCKLIST:
-            add_log(f"Rule 3 (Report Title): Found '{code}'")
-            return code
-            
+    # 規則 3: 檢查高優先度代碼是否單獨存在於頁面頂部
+    if 'OFS' in upper_text[:300]: # 只搜索文件開頭部分
+        return 'OFS'
+    if 'WMG' in upper_text[:300]:
+        return 'WMG'
+    if 'WCL' in upper_text[:300]:
+        return 'WCL'
+
+    # 如果以上規則都失敗，返回 None
     return None
 
+# AI調用函數 (UNCHANGED)
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
     reraise=True
 )
 def make_api_call(model, prompt, image):
-    """Makes a call to the Gemini API with automatic retries."""
+    """調用Gemini API（帶重試）"""
     check_rate_limit()
     try:
         return model.generate_content([prompt, image], generation_config=genai.types.GenerationConfig(
             temperature=0
         ))
     except Exception as e:
-        if "429" in str(e): # Specific handling for rate limit errors
+        if "429" in str(e):
             time.sleep(5)
         raise e
 
+# 核心識別函數 (Original structure with MODIFIED PROMPT)
 def extract_code_with_ai(pdf_path, page_number, api_key, status_text):
     """
-    Uses enhanced rules and an adaptive AI model to identify the agency code.
-    It prioritizes the rule-based method and uses AI as a fallback.
+    使用增強的AI和決策邏輯識別代碼 - 針對 Rpt_614 格式進行了特別優化。
     """
     doc = None
     page_text = ""
+    text_extracted_code = None
     
     try:
-        # Step 1: Extract text from the PDF page
+        # 步驟 1: 使用優化後的文本規則提取
         doc = fitz.open(pdf_path)
         page = doc[page_number]
         page_text = page.get_text()
         doc.close()
+        text_extracted_code = extract_code_from_text(page_text)
 
-        # Step 2: Use the new, powerful rule-based extraction function first
-        rule_based_code = extract_code_with_rules(page_text)
+        if text_extracted_code and not api_key:
+            add_log(f"第 {page_number+1} 頁: 無API密鑰，使用文本規則找到 '{text_extracted_code}'。")
+            return {"code": text_extracted_code, "method": "text_rule_only", "confidence": "high", "text": page_text}
+        
+        if not api_key:
+            return {"code": "UNK", "method": "text_rule_only", "confidence": "low", "text": page_text}
 
-        # Step 3: Decision Logic
-        # If the rules find a code, we trust it. It's fast, cheap, and highly reliable.
-        if rule_based_code:
-            add_log(f"Page {page_number+1}: Decision - Trusting reliable rule-based result '{rule_based_code}'.")
-            return {"code": rule_based_code, "method": "rules_optimized", "confidence": "high", "text": page_text}
+        # 步驟 2: 準備並調用AI模型
+        status_text.text(f"正在使用AI增強分析第 {page_number+1} 頁...")
+        page_image = convert_pdf_to_image(pdf_path, page_number)
 
-        # If rules fail AND we have an API key, use AI as a fallback.
-        if api_key:
-            status_text.text(f"Rules failed for page {page_number+1}. Using AI analysis...")
-            page_image = convert_pdf_to_image(pdf_path, page_number)
+        if not page_image:
+            code = text_extracted_code if text_extracted_code else "UNK"
+            return {"code": code, "method": "text_rule_fallback", "confidence": "medium" if code != "UNK" else "low", "text": page_text}
 
-            if not page_image:
-                add_log(f"Page {page_number+1}: Could not convert to image for AI.", "warning")
-                return {"code": "UNKNOWN", "method": "rules_failed", "confidence": "low", "text": page_text}
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # --- THIS IS THE ONLY CHANGE: THE NEW, ADAPTIVE PROMPT ---
+        prompt = """You are a specialized financial document analyst. Your task is to find a single 3-letter agency code on the page.
 
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-1.5-flash')
+        Follow these rules in order:
+        1.  **Primary Location (Top-Left):** Look for a 3-letter code standing alone at the very top-left of the page (e.g., 'APO', 'FPL', 'OFS'). This is the most likely location.
+        2.  **Secondary Location (WA Code Column):** If not found, look in the "WA Code" column. The code is the first 3 letters of entries like 'FPL007' or 'OFS030'.
+        3.  **Tertiary Location (Title):** Look for the code in the main report title, which might be "Received Fees Report XXX" or "Outstanding Fees Report XXX".
+
+        **CRITICAL RULES TO IGNORE:**
+        -   **NEVER** use 'WHK'. It is part of an Account Number.
+        -   **NEVER** use 'ALL', 'USD', 'HKD', or any currency/month code.
+        -   **NEVER** use 'CTS' or any part of the footer/header like 'Print Date'.
+
+        The code is always exactly 3 uppercase letters. Analyze the page and return ONLY a JSON object with your finding. If no valid code is found, return "UNK".
+
+        Example Response:
+        {
+            "code": "FPL"
+        }
+        """
+        
+        response = make_api_call(model, prompt, page_image)
+        
+        # 解析AI響應
+        ai_code = "UNK"
+        try:
+            json_str = response.text
+            if '```json' in json_str:
+                json_str = json_str.split('```json')[1].split('```')
+            elif '```' in json_str:
+                json_str = json_str.split('```').split('```')[0]
             
-            # --- NEW ADAPTIVE AI PROMPT ---
-            prompt = """You are a specialized financial document analyst. Your task is to find a single 3-letter agency code on the page.
+            ai_results = json.loads(json_str.strip())
+            ai_code = ai_results.get('code', 'UNK').upper()
+        except Exception as e:
+            add_log(f"第 {page_number+1} 頁: AI響應解析失敗: {e}", "error")
+            ai_code = "UNK"
 
-            Follow these rules in order:
-            1.  **Primary Location (Top-Left):** Look for a 3-letter code standing alone at the very top-left of the page (e.g., 'APO', 'FPL', 'OFS'). This is the most likely location.
-            2.  **Secondary Location (WA Code Column):** If not found, look in the "WA Code" column. The code is the first 3 letters of entries like 'FPL007' or 'OFS030'.
-            3.  **Tertiary Location (Title):** Look for the code in the main report title, which might be "Received Fees Report XXX" or "Outstanding Fees Report XXX".
-
-            **CRITICAL RULES TO IGNORE:**
-            -   **NEVER** use 'WHK'. It is part of an Account Number.
-            -   **NEVER** use 'ALL', 'USD', 'HKD', or any currency/month code.
-            -   **NEVER** use 'CTS' or any part of the footer/header like 'Print Date'.
-
-            The code is always exactly 3 uppercase letters. Analyze the page and return ONLY a JSON object with your finding. If no valid code is found, return "UNK".
-
-            Example Response:
-            {
-                "code": "FPL"
-            }
-            """
+        # 步驟 3: 最終決策 (Original Logic)
+        if text_extracted_code:
+            add_log(f"第 {page_number+1} 頁: 決策 - 信任優化後的文本規則結果 '{text_extracted_code}'。")
+            final_code = text_extracted_code
+            method = "text_rule_optimized"
+            confidence = "high"
+        elif ai_code != "UNK":
+            add_log(f"第 {page_number+1} 頁: 決策 - 文本規則失敗，使用AI結果 '{ai_code}'。")
+            final_code = ai_code
+            method = "ai_fallback"
+            confidence = "medium"
+        else:
+            add_log(f"第 {page_number+1} 頁: 決策 - 所有方法均失敗。")
+            final_code = "UNK"
+            method = "combined_failure"
+            confidence = "low"
             
-            response = make_api_call(model, prompt, page_image)
-            
-            try:
-                # Robust JSON parsing from AI response
-                json_str = response.text
-                if '```json' in json_str:
-                    json_str = json_str.split('```json')[1].split('```')
-                
-                ai_results = json.loads(json_str.strip())
-                ai_code = ai_results.get('code', 'UNK').upper()
-                add_log(f"Page {page_number+1}: AI analysis returned '{ai_code}'.")
-                final_code = ai_code if ai_code not in ["UNK", ""] else "UNKNOWN"
-                return {"code": final_code, "method": "ai_fallback", "confidence": "medium", "text": page_text}
-            except Exception as e:
-                add_log(f"Page {page_number+1}: AI response parsing failed: {e}", "error")
-                return {"code": "UNKNOWN", "method": "ai_error", "confidence": "low", "text": page_text}
-
-        # If rules fail and there's no API key, we mark as unknown.
-        add_log(f"Page {page_number+1}: Rules failed and no API key available.", "warning")
-        return {"code": "UNKNOWN", "method": "rules_failed_no_api", "confidence": "low", "text": page_text}
+        return {"code": final_code, "method": method, "confidence": confidence, "text": page_text}
 
     except Exception as e:
-        add_log(f"Critical error processing page {page_number+1}: {str(e)}", "error")
-        return {"code": "UNKNOWN", "method": "error", "confidence": "low", "text": page_text}
-    finally:
-        if doc:
-            doc.close()
-
-# --- UNCHANGED UTILITY AND PROCESSING FUNCTIONS ---
+        add_log(f"第 {page_number+1} 頁處理時發生嚴重錯誤: {str(e)}", "error")
+        if text_extracted_code:
+            return {"code": text_extracted_code, "method": "error_fallback_text", "confidence": "low", "text": page_text}
+        return {"code": "UNK", "method": "error", "confidence": "low", "text": page_text}
 
 def convert_pdf_to_image(pdf_path, page_num):
-    """Converts a PDF page to a high-quality image for AI analysis."""
+    """將PDF頁面轉換為圖像 - 增強清晰度版本"""
     doc = None
     try:
         doc = fitz.open(pdf_path)
         page = doc[page_num]
-        zoom = 4  # Increased zoom for better clarity
+        zoom = 6
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img_data = pix.tobytes("png")
-        return Image.open(io.BytesIO(img_data))
+        img = Image.open(io.BytesIO(img_data))
+        return img
     except Exception as e:
-        add_log(f"PDF to image conversion error: {str(e)}", "error")
+        add_log(f"PDF轉圖像錯誤: {str(e)}", "error")
         return None
     finally:
         if doc:
             doc.close()
 
 def is_summary_page(text):
-    """Checks if a page is a summary or final page."""
+    """檢查頁面是否為摘要頁"""
     if not text:
         return False
     summary_indicators = ["End of Report", "End of Reoprt", "Summary", "Grand Total"]
-    # Check if any indicator is present, case-insensitively
-    return any(indicator.lower() in text.lower() for indicator in summary_indicators)
+    return any(indicator in text for indicator in summary_indicators)
 
 def determine_report_type(page_text):
-    """Determines the report type to assist in filename generation."""
+    """根據內容確定報表類型"""
     if "Received Fees Report" in page_text:
         return {'report_num': '615', 'format': 'MF'}
     elif "Outstanding" in page_text:
         return {'report_num': '614', 'format': 'Outstanding'}
-    return {'report_num': '615', 'format': 'MF'} # Default
+    return {'report_num': '615', 'format': 'MF'}
 
 def generate_filename(code, page_text):
-    """Generates a standardized filename based on the code and report type."""
+    """生成適當的文件名"""
     report_info = determine_report_type(page_text)
     report_num = report_info['report_num']
     format_type = report_info['format']
@@ -255,7 +266,7 @@ def generate_filename(code, page_text):
         return f"Rpt_{report_num}_{code}_MF"
 
 def create_zip_buffer(generated_files):
-    """Creates a ZIP file in memory containing all generated PDFs."""
+    """創建包含所有文件的ZIP壓縮包"""
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         for file in generated_files:
@@ -264,14 +275,15 @@ def create_zip_buffer(generated_files):
     return zip_buffer
 
 def process_pdf(uploaded_file, progress_bar, status_text):
-    """Main function to orchestrate the PDF splitting process."""
+    """處理PDF文件"""
     temp_path = None
+    
     try:
         st.session_state.processing_complete = False
         st.session_state.zip_data = None
         
         if not GEMINI_API_KEY:
-            st.warning("Gemini API key not configured. Accuracy may be reduced. Using rule-based extraction only.")
+            st.warning("未配置Gemini API密鑰，將僅使用文本規則識別代碼。請聯繫管理員設置API密鑰以提高識別準確率。")
         
         st.session_state.generated_files = []
         
@@ -285,39 +297,47 @@ def process_pdf(uploaded_file, progress_bar, status_text):
         
         page_codes = []
         
-        # Step 1: Identify codes for all pages
         for page_num in range(total_pages):
             progress = (page_num + 1) / (total_pages * 2)
             progress_bar.progress(progress)
-            status_text.text(f"Analyzing page {page_num + 1}/{total_pages}...")
+            status_text.text(f"識別第 {page_num + 1}/{total_pages} 頁的代碼...")
             
             doc = fitz.open(temp_path)
             page_text = doc[page_num].get_text()
             doc.close()
             
-            if is_summary_page(page_text):
+            if is_summary_page(page_text) or page_num == total_pages - 1:
                 page_codes.append({'page_num': page_num, 'code': 'SUMMARY', 'text': page_text})
                 continue
             
             code_info = extract_code_with_ai(temp_path, page_num, GEMINI_API_KEY, status_text)
+            
+            code = code_info.get('code', 'UNK')
+            if code in ['UNK', 'ALL']:
+                code = 'UNKNOWN'
+            
             page_codes.append({
                 'page_num': page_num,
-                'code': code_info.get('code', 'UNKNOWN'),
+                'code': code,
                 'text': code_info.get('text', ''),
+                'method': code_info.get('method', 'text_rule'),
+                'confidence': code_info.get('confidence', 'medium')
             })
-            time.sleep(0.05)
+            time.sleep(0.1)
         
-        # Step 2: Group consecutive pages with the same code
         page_groups = []
         current_group = []
-        for page_info in page_codes:
+        
+        # Corrected Grouping Logic
+        for i, page_info in enumerate(page_codes):
             if page_info['code'] == 'SUMMARY':
                 if current_group:
                     page_groups.append(current_group)
-                    current_group = []
+                current_group = []
                 continue
             
-            if not current_group or page_info['code'] == current_group['code']:
+            # Compare with the code of the first item in the current group
+            if not current_group or page_info['code'] == current_group[0]['code']:
                 current_group.append(page_info)
             else:
                 page_groups.append(current_group)
@@ -326,176 +346,224 @@ def process_pdf(uploaded_file, progress_bar, status_text):
         if current_group:
             page_groups.append(current_group)
         
-        # Step 3: Create a new PDF for each group
-        status_text.text("Merging pages and creating files...")
+        status_text.text("正在合併連續相同代碼的頁面...")
+        
         for group_index, group in enumerate(page_groups):
             progress = 0.5 + ((group_index + 1) / (len(page_groups) * 2))
             progress_bar.progress(progress)
             
             if not group: continue
             
-            code = group['code']
-            filename = f"{generate_filename(code, group['text'])}.pdf"
+            code = group[0]['code']
+            first_page_text = group[0]['text']
             
-            output_doc = fitz.open()
+            base_filename = generate_filename(code, first_page_text)
+            filename = f"{base_filename}.pdf"
+            
+            temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+            temp_output.close()
+            
             source_doc = fitz.open(temp_path)
-            for page_info in group:
-                output_doc.insert_pdf(source_doc, from_page=page_info['page_num'], to_page=page_info['page_num'])
+            output_doc = fitz.open()
             
-            # Save to a memory buffer
-            pdf_bytes = output_doc.tobytes(garbage=4, clean=True, deflate=True)
+            for page_info in group:
+                page_num = page_info['page_num']
+                output_doc.insert_pdf(source_doc, from_page=page_num, to_page=page_num)
+            
+            output_doc.save(temp_output.name, garbage=4, clean=True, deflate=True)
             output_doc.close()
             source_doc.close()
             
+            with open(temp_output.name, 'rb') as file:
+                file_content = file.read()
+            
             st.session_state.generated_files.append({
                 'filename': filename,
-                'content': pdf_bytes,
+                'content': file_content,
                 'pages': [p['page_num'] for p in group],
                 'code': code,
                 'page_count': len(group),
+                'method': group[0].get('method', 'text_rule'),
+                'confidence': group[0].get('confidence', 'medium')
             })
-            time.sleep(0.05)
             
+            try:
+                os.remove(temp_output.name)
+            except: pass
+            time.sleep(0.1)
+        
         st.session_state.processing_complete = True
+        
         if st.session_state.generated_files:
             st.session_state.zip_data = create_zip_buffer(st.session_state.generated_files)
         
         return st.session_state.generated_files
     
     except Exception as e:
-        st.error(f"An error occurred during PDF processing: {str(e)}")
+        st.error(f"處理PDF時出錯: {str(e)}")
+        # For debugging, show the full error
+        import traceback
+        st.code(traceback.format_exc())
         return []
     
     finally:
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
-            except Exception as e:
-                add_log(f"Failed to remove temp file: {e}", "error")
+            except: pass
 
 def set_preview_file(file_index):
-    """Sets the file to be displayed in the preview pane."""
+    """設置要預覽的文件"""
     st.session_state.selected_file_for_preview = file_index
 
-# --- STREAMLIT UI LAYOUT ---
-
-st.set_page_config(layout="wide")
-st.title("PDF Report Splitter")
-st.write("This tool splits multi-page PDF reports into separate files based on an agency code.")
+# --- Streamlit UI (Unchanged) ---
+st.title("PDF報表拆分工具")
+st.write("此工具可以將多頁PDF報表按機構代碼拆分成單獨的文件")
 
 with st.sidebar:
-    st.header("Instructions")
-    st.markdown("""
-    1.  **Upload** your PDF file.
-    2.  Click the **Process PDF** button.
-    3.  **Wait** for the processing to complete.
-    4.  **Download** your split files individually or as a single ZIP file.
-    """)
+    st.header("使用說明")
+    st.markdown("1. 上傳PDF文件")
+    st.markdown("2. 點擊「處理PDF」按鈕")
+    st.markdown("3. 等待處理完成")
+    st.markdown("4. 下載拆分後的文件")
     st.markdown("---")
-    st.subheader("Features")
-    st.markdown("""
-    - Automatically groups consecutive pages with the same code.
-    - Creates a separate PDF for each agency code group.
-    - Ignores summary and end-of-report pages.
-    """)
+    st.subheader("功能說明")
+    st.markdown("- 連續的相同代碼頁面會自動合併為一個PDF文件")
+    st.markdown("- 不同代碼的頁面會分開成獨立的PDF文件")
+    st.markdown("- 摘要頁面會被自動忽略")
     st.markdown("---")
-    st.subheader("System Status")
+    st.subheader("兼容性說明")
+    st.info("如果您在Adobe查看器中遇到顯示問題，請嘗試使用Chrome或Edge瀏覽器打開生成的文件")
+    st.markdown("---")
+    st.subheader("系統狀態")
     if GEMINI_API_KEY:
-        st.success("✅ Gemini API is configured.")
+        st.success("✅ Gemini API已配置")
     else:
-        st.warning("⚠️ Gemini API not configured.")
-        st.info("The tool will rely on rule-based extraction only. For best results, configure the API key.")
+        st.warning("⚠️ Gemini API未配置")
+        st.info("請聯繫管理員配置API以提高識別準確率")
 
-uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+uploaded_file = st.file_uploader("選擇PDF文件", type="pdf")
 
 if uploaded_file is not None:
-    st.info(f"Uploaded: **{uploaded_file.name}** ({round(uploaded_file.size/1024, 1)} KB)")
+    st.info(f"已上傳: {uploaded_file.name} ({round(uploaded_file.size/1024, 1)} KB)")
     
-    if st.button("Process PDF", key="process_button", use_container_width=True, type="primary"):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            temp_path = tmp_file.name
+            
+        doc = fitz.open(temp_path)
+        pix = doc[0].get_pixmap(matrix=fitz.Matrix(0.5, 0.5))
+        img_data = pix.tobytes("png")
+        
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            st.write("文件首頁預覽:")
+        with col2:
+            st.image(img_data)
+        
+        doc.close()
+        os.remove(temp_path)
+    except Exception as e:
+        st.warning(f"無法顯示預覽")
+
+    process_button = st.button("處理PDF", key="process_button", use_container_width=True)
+    
+    if process_button:
         st.session_state.processing_complete = False
         st.session_state.zip_data = None
         st.session_state.selected_file_for_preview = None
         
         progress_container = st.container()
         with progress_container:
-            status_text = st.empty()
+            st.write("處理進度:")
             progress_bar = st.progress(0)
-            status_text.text("Starting process...")
+            status_text = st.empty()
+            status_text.text("準備處理...")
             
             generated_files = process_pdf(uploaded_file, progress_bar, status_text)
             
             progress_bar.progress(1.0)
-            if generated_files:
-                status_text.success(f"Processing complete! {len(generated_files)} files were generated.")
-            else:
-                status_text.error("Processing finished, but no files were generated. Please check the PDF content.")
+            status_text.text(f"處理完成! 已生成 {len(generated_files)} 個文件。")
+            
+            if len(generated_files) > 0:
+                st.success("✓ 處理成功! 請點擊下方的下載按鈕獲取處理後的文件。")
+                st.info("💡 提示: 如果在Adobe中查看文件有問題，請嘗試使用Chrome或Edge打開。")
 
 if st.session_state.processing_complete and st.session_state.generated_files:
     st.markdown("---")
-    st.header(f"Processing Results ({len(st.session_state.generated_files)} files)")
+    st.subheader(f"處理結果 (共 {len(st.session_state.generated_files)} 個文件)")
     
     if st.session_state.zip_data:
         st.download_button(
-            label=f"⬇️ Download All as ZIP ({len(st.session_state.generated_files)} files)",
+            label=f"下載所有文件 (ZIP包含 {len(st.session_state.generated_files)} 個文件)",
             data=st.session_state.zip_data,
-            file_name=f"{os.path.splitext(uploaded_file.name)}_split.zip",
+            file_name="processed_files.zip",
             mime="application/zip",
             use_container_width=True
         )
     
-    col1, col2 = st.columns()
-
-    with col1:
-        st.subheader("Generated Files")
-        # Group files by code for organized display
-        grouped_files = {}
-        for i, file in enumerate(st.session_state.generated_files):
-            code = file.get('code', 'UNKNOWN')
-            if code not in grouped_files:
-                grouped_files[code] = []
-            grouped_files[code].append((i, file))
-        
-        for code, files in grouped_files.items():
-            with st.expander(f"Code: {code} ({len(files)} file(s))", expanded=True):
-                for file_idx, file in files:
-                    c1, c2 = st.columns()
-                    with c1:
-                        page_range_str = f" (Original Pgs: {min(file['pages'])+1}-{max(file['pages'])+1})" if len(file['pages']) > 1 else f" (Original Pg: {file['pages']+1})"
-                        if st.button(f"📄 {file['filename']}", key=f"preview_{file_idx}", use_container_width=True):
-                            set_preview_file(file_idx)
-                    with c2:
-                        st.download_button(
-                            label="Download",
-                            data=file['content'],
-                            file_name=file['filename'],
-                            mime="application/pdf",
-                            key=f"download_{file_idx}"
-                        )
-
-    with col2:
-        st.subheader("Preview")
-        if st.session_state.selected_file_for_preview is not None:
-            file_idx = st.session_state.selected_file_for_preview
+    grouped_files = {}
+    for i, file in enumerate(st.session_state.generated_files):
+        code = file.get('code', 'UNK')
+        if code not in grouped_files:
+            grouped_files[code] = []
+        grouped_files[code].append((i, file))
+    
+    tabs = st.tabs([f"{code} ({len(files)})" for code, files in grouped_files.items()])
+    
+    for i, (code, files) in enumerate(grouped_files.items()):
+        with tabs[i]:
+            st.write("點擊檔案名稱來預覽文件:")
+            
+            for file_idx, file in files:
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    page_range = f"第{min(file['pages'])+1}-{max(file['pages'])+1}頁" if len(file['pages']) > 1 else f"第{file['pages'][0]+1}頁"
+                    if st.button(f"{file['filename']} ({page_range}, 共{file['page_count']}頁)", key=f"file_{file_idx}", use_container_width=True):
+                        set_preview_file(file_idx)
+                with col2:
+                    st.download_button(
+                        label="下載",
+                        data=file['content'],
+                        file_name=file['filename'],
+                        mime="application/pdf",
+                        key=f"download_{file_idx}"
+                    )
+            
+            st.info(f"機構代碼 {code}: {len(files)} 個文件")
+    
+    if st.session_state.selected_file_for_preview is not None:
+        file_idx = st.session_state.selected_file_for_preview
+        if 0 <= file_idx < len(st.session_state.generated_files):
             file = st.session_state.generated_files[file_idx]
             
-            st.info(f"Showing preview for: **{file['filename']}**")
+            st.markdown("---")
+            st.subheader(f"預覽: {file['filename']}")
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                tmp_file.write(file['content'])
+                temp_path = tmp_file.name
             
             try:
-                doc = fitz.open(stream=file['content'], filetype="pdf")
+                doc = fitz.open(temp_path)
                 max_preview_pages = min(5, doc.page_count)
                 
-                st.write(f"Previewing first {max_preview_pages} of {doc.page_count} page(s):")
+                st.write(f"預覽前 {max_preview_pages} 頁 (共 {doc.page_count} 頁):")
                 
                 for page_idx in range(max_preview_pages):
                     page = doc[page_idx]
-                    pix = page.get_pixmap(dpi=150) # Use DPI for better quality preview
-                    st.image(pix.tobytes("png"), caption=f"Page {page_idx+1}")
+                    pix = page.get_pixmap(matrix=fitz.Matrix(0.8, 0.8))
+                    img_data = pix.tobytes("png")
+                    st.image(img_data, caption=f"第 {page_idx+1} 頁")
                 
                 doc.close()
             except Exception as e:
-                st.error(f"Could not display preview: {e}")
-        else:
-            st.info("Click on a file from the list on the left to see a preview here.")
+                st.error(f"顯示預覽時出錯")
+            finally:
+                try:
+                    os.remove(temp_path)
+                except: pass
 
 st.markdown("---")
-st.markdown("<div style='text-align: center;'>© 2025 PDF Report Splitter</div>", unsafe_allow_html=True)
+st.markdown("© 2025 PDF報表拆分工具")
